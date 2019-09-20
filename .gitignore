@@ -1,0 +1,11 @@
+# Python
+.venv
+.mypy_cache
+.pytest_cache
+__pycache__
+
+# Environment
+.env
+
+# Editor
+.vscode
