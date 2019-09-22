@@ -1,14 +1,15 @@
 import logging
 import sys
 from os import getenv
-from typing import Dict, List, Optional
-from uuid import UUID
+from typing import Dict, List
 import structlog
 from json import JSONDecodeError
 from marshmallow import ValidationError
 from confluent_kafka import Consumer, Message, KafkaException
 from messaging.events import BaseMessageEvent, ContextAddedToCapabilityEventMessage
-from github import Github, Repository
+from terraform.aws_account_tfvars import AWSAccountTfvars
+from github import Github, GithubException
+from state.github_repo_uploader import GithubRepoUploader
 
 # Logging
 logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
@@ -36,50 +37,6 @@ LOG: structlog.BoundLogger = structlog.get_logger()
 # Github integration
 GITHUB_REPO_PATH: str = "wcarlsen/py2github"
 github_access: Github = Github(getenv("GITHUB_USERNAME"), getenv("GITHUB_PASSWORD"))
-github_repo: Repository = github_access.get_repo(GITHUB_REPO_PATH)
-
-# Terraform module version
-TF_MODULE_VERSION: Optional[str] = getenv("TF_MODULE_VERSION")
-
-# Loading Terraform template
-with open("src/templates/template.tfvars") as template_file:
-    TEMPLATE: str = template_file.read()
-
-
-# Capability context aws account tfvars class
-class AWSAccountTfvars(object):
-    """
-    AWS account tfvars
-    """
-
-    def __init__(
-        self,
-        template: str,
-        context_added_message: ContextAddedToCapabilityEventMessage,
-        module_version: Optional[str],
-    ) -> None:
-        self.template: str = template
-        self.account_name: str = context_added_message.payload.capability_root_id
-        self.context_id: UUID = context_added_message.payload.context_id
-        self.correlation_id: UUID = context_added_message.correlation_id
-        self.capability_name: str = context_added_message.payload.capability_name
-        self.capability_root_id: str = context_added_message.payload.capability_root_id
-        self.context_name: str = context_added_message.payload.context_name
-        self.capability_id: UUID = context_added_message.payload.capability_id
-        self.module_version: Optional[str] = module_version
-
-    def generate_tfvars(self) -> str:
-        return (
-            self.template.replace("ACCOUNTNAME", self.account_name)
-            .replace("CONTEXT_ID", str(self.context_id))
-            .replace("CORRELATION_ID", str(self.correlation_id))
-            .replace("CAPABILITY_NAME", self.capability_name)
-            .replace("CAPABILITY_ROOT_ID", self.capability_root_id)
-            .replace("CONTEXT_NAME", self.context_name)
-            .replace("CAPABILITY_ID", str(self.capability_id))
-            .replace("TF_MODULE_VERSION", str(self.module_version))
-        )
-
 
 # Event name in scope
 CONTEXT_ADDED_EVENT: str = "context_added_to_capability"
@@ -120,53 +77,39 @@ try:
             raise KafkaException(msg.error())
 
         else:
-            try:
-                # Message recieved
-                MESSAGE = msg.value().decode("utf-8")
-                LOG.info("Message recieved", message=MESSAGE)
+            # Message recieved
+            MESSAGE = msg.value().decode("utf-8")
+            LOG.info("Message recieved", message=MESSAGE)
 
+            try:
                 # Deserialize message
                 BASE_MESSAGE: BaseMessageEvent = BaseMessageEvent.Schema().loads(
                     MESSAGE
                 )
 
-                # Message consumed
+                # Message consume
                 if BASE_MESSAGE.event == CONTEXT_ADDED_EVENT:
-                    CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE: ContextAddedToCapabilityEventMessage = ContextAddedToCapabilityEventMessage.Schema().loads(  # noqa: E501
+                    CATCEM: ContextAddedToCapabilityEventMessage = ContextAddedToCapabilityEventMessage.Schema().loads(  # noqa: E501
                         MESSAGE
                     )
-                    repo_content = github_repo.get_contents("")
-                    if str(
-                        CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE.payload.context_id
-                    ) not in [content.name for content in repo_content]:
-                        github_repo.create_file(
-                            str(
-                                CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE.payload.context_id
-                            )
-                            + "/terraform.tfvars",
-                            "Added AWS account tfvars for "
-                            + CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE.payload.capability_name,
-                            AWSAccountTfvars(
-                                template=TEMPLATE,
-                                context_added_message=CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE,
-                                module_version=TF_MODULE_VERSION,
-                            ).generate_tfvars(),
-                            branch="master",
-                        )
-                        LOG.info(
-                            "Tfvars pushed to Github",
-                            message=CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE,
-                        )
+                    grl: GithubRepoUploader = GithubRepoUploader(
+                        github_access,
+                        GITHUB_REPO_PATH,
+                        CATCEM.payload.context_id,
+                        CATCEM.payload.capability_name,
+                        AWSAccountTfvars(
+                            CATCEM, "src/templates/template.tfvars"
+                        ).generate_tfvars(),
+                    )
+                    if not grl.context_exists_in_repo():
+                        grl.upload_context_aws_account()
+                        LOG.info("Tfvars pushed to Github", message=CATCEM)
                     else:
                         LOG.warning(
-                            "Tfvars already exists",
-                            message=CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE,
+                            "Tfvars already exists, skipping upload", message=CATCEM
                         )
                     consumer.commit(message=msg)
-                    LOG.info(
-                        "Message consumed",
-                        message=CONTEXT_ADDED_TO_CAPABILITY_EVENT_MESSAGE,
-                    )
+                    LOG.info("Message consumed", message=CATCEM)
 
                 else:
                     consumer.commit(message=msg)
@@ -174,6 +117,7 @@ try:
                         "Message out of scope", message=BASE_MESSAGE, commited=True
                     )
 
+            # Error commit strategy
             except JSONDecodeError as json_err:
                 consumer.commit(message=msg)
                 LOG.error(
@@ -191,6 +135,9 @@ try:
                     commited=True,
                     error_message=valid_err.messages,
                 )
+
+            except GithubException as github_err:
+                LOG.error("Github error", commited=False, error_message=github_err.data)
 
 except KeyboardInterrupt:
     LOG.warning("Polling stopped by user")
