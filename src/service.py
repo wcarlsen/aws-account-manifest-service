@@ -1,37 +1,17 @@
-import logging
-import sys
 from os import getenv
 from typing import Dict, List
 import structlog
 from json import JSONDecodeError
 from marshmallow import ValidationError
 from confluent_kafka import Consumer, Message, KafkaException
+from utils.logging import init_logging
 from messaging.events import BaseMessageEvent, ContextAddedToCapabilityEventMessage
 from terraform.aws_account_tfvars import AWSAccountTfvars
 from github import Github, GithubException
 from state.github_repo_uploader import GithubRepoUploader
 
 # Logging
-logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
-
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        # structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer(),
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
-
+init_logging()
 LOG: structlog.BoundLogger = structlog.get_logger()
 
 # Github integration
@@ -47,6 +27,7 @@ KAFKA_CONFIG: Dict = {
     "group.id": "aws-account-manifest-service-consumer",
     "auto.offset.reset": "earliest",
     "enable.auto.commit": False,
+    # "debug": "broker",
 }
 
 # Kafka topics

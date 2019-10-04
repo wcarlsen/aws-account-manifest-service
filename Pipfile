@@ -9,6 +9,7 @@ pylint = "*"
 mypy = "*"
 black = "*"
 pytest = "*"
+pytest-cov = "*"
 
 [packages]
 confluent-kafka = "*"
